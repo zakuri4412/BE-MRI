@@ -155,16 +155,14 @@ async def predict_volume_slice(
     
 
 @app.post("/upload-volume")
-async def upload_volume(file: UploadFile = File(...)):
+# main.py — thay toàn bộ 2 endpoint cũ bằng đây
+
+@app.post("/upload-volume")
+async def upload_volume(file: UploadFile = File(...), threshold: float = Form(0.5)):
     contents = await file.read()
     filename = file.filename.lower()
 
-    if filename.endswith(".nii.gz"):
-        suffix = ".nii.gz"
-    elif filename.endswith(".nii"):
-        suffix = ".nii"
-    else:
-        suffix = ".nii.gz"
+    suffix = ".nii.gz" if filename.endswith(".nii.gz") else ".nii"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(contents)
@@ -173,12 +171,92 @@ async def upload_volume(file: UploadFile = File(...)):
     nii = nib.load(tmp_path)
     volume = nii.get_fdata()
 
+    # Normalize
     volume = (volume - volume.min()) / (volume.max() - volume.min() + 1e-8)
 
-    volume_id = str(uuid.uuid4())
-    VOLUME_CACHE[volume_id] = volume
+    total_slices = volume.shape[2]
+    median_idx = total_slices // 2
+    start_idx = max(0, median_idx - 60)
+    end_idx   = min(total_slices - 1, median_idx + 60)
+
+    slices_out = []
+
+    for i in range(start_idx, end_idx + 1):
+        slice_img = volume[:, :, i]
+        slice_resized = cv2.resize(slice_img, (128, 128))
+        input_img = slice_resized[np.newaxis, ..., np.newaxis]
+
+        start = time.time()
+        pred = model.predict(input_img, verbose=0)
+        inference_time = time.time() - start
+
+        # Mask
+        mask = postprocess_mask(pred, threshold)
+
+        # Heatmap
+        heatmap_gray = postprocess_heatmap(pred)
+        heatmap_color = cv2.applyColorMap(heatmap_gray, cv2.COLORMAP_JET)
+
+        # Prob map
+        prob = (pred[0, ..., 0] * 255).astype(np.uint8)
+
+        # Overlay (MRI + red mask)
+        mri_display = (slice_resized * 255).astype(np.uint8)
+        mri_bgr = cv2.cvtColor(mri_display, cv2.COLOR_GRAY2BGR)
+        red_mask = np.zeros_like(mri_bgr)
+        red_mask[mask > 0] = [0, 0, 255]  # BGR red
+        overlay = cv2.addWeighted(mri_bgr, 1.0, red_mask, 0.45, 0)
+
+        # Metrics
+        metrics = compute_metrics(mask, pred, inference_time)
+
+        def enc(arr):
+            _, buf = cv2.imencode(".png", arr)
+            return base64.b64encode(buf).decode()
+
+        slices_out.append({
+            "slice_index": i,
+            "slice":   enc(mri_display),
+            "mask":    enc(mask),
+            "heatmap": enc(heatmap_color),
+            "prob":    enc(prob),
+            "overlay": enc(overlay),
+            "metrics": metrics,
+        })
 
     return {
-        "volume_id": volume_id,
-        "num_slices": volume.shape[2]
+        "volume_id": str(uuid.uuid4()),
+        "median_index": median_idx,
+        "start_index": start_idx,
+        "end_index": end_idx,
+        "num_slices": end_idx - start_idx + 1,
+        "slices": slices_out,
     }
+
+# async def upload_volume(file: UploadFile = File(...)):
+#     contents = await file.read()
+#     filename = file.filename.lower()
+
+#     if filename.endswith(".nii.gz"):
+#         suffix = ".nii.gz"
+#     elif filename.endswith(".nii"):
+#         suffix = ".nii"
+#     else:
+#         suffix = ".nii.gz"
+
+#     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+#         tmp.write(contents)
+#         tmp_path = tmp.name
+
+#     nii = nib.load(tmp_path)
+#     volume = nii.get_fdata()
+
+#     volume = (volume - volume.min()) / (volume.max() - volume.min() + 1e-8)
+
+#     volume_id = str(uuid.uuid4())
+#     VOLUME_CACHE[volume_id] = volume
+
+#     return {
+#         "volume_id": volume_id,
+#         "num_slices": volume.shape[2]
+#     }
